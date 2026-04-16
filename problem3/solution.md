@@ -2,49 +2,61 @@
 
 ## Scenario
 
-Ubuntu 24.04 VM, 64GB disk, running only NGINX (as a load balancer / traffic router). Monitoring reports 99% disk usage.
+Ubuntu 24.04 VM, 64GB disk, running only NGINX as a load balancer. Monitoring reports 99% disk usage.
 
 ---
 
-## Step 1 — Initial Triage
+## Step 1 — Find where disk space is going
 
 ```bash
+# Check overall disk usage by partition
 df -h
+
+# Find the largest top-level directories
 du -sh /* 2>/dev/null | sort -rh | head -20
+
+# Drill into /var (most likely culprit — logs live here)
 du -sh /var/* 2>/dev/null | sort -rh | head -10
+```
+
+---
+
+## Step 2 — Investigate the most likely causes
+
+```bash
+# 1. Check NGINX log sizes — most common cause on an LB-only VM
 du -sh /var/log/nginx/*
 ls -lh /var/log/nginx/
+
+# 2. Check systemd journal size — often overlooked
 journalctl --disk-usage
-find / -type f -size +100M 2>/dev/null | xargs ls -lh | sort -k5 -rh | head -20
+
+# 3. Check for core dump files — each can be several GB
 find / -name "core*" -type f 2>/dev/null
 ls -lh /var/crash/ 2>/dev/null
-du -sh /var/cache/apt/
+
+# 4. Check NGINX client body temp files — orphaned on crash
 du -sh /var/lib/nginx/tmp/ 2>/dev/null
+
+# 5. Check apt package cache — leftover from OS updates
+du -sh /var/cache/apt/
 ```
 
 ---
 
-## Cause 1: NGINX Access / Error Logs Filling Disk
+## Root Causes, Impacts & Fixes
 
-**Likelihood: Very High**
+### Cause 1 — NGINX logs unbounded (Likelihood: Very High)
 
-NGINX writes every proxied request to access.log. At high traffic volumes this log grows at gigabytes per day with no rotation.
+**Impact:** Disk fills silently → OS cannot write temp files or fork processes → SSH may become unresponsive.
 
-**Diagnosis:**
 ```bash
-ls -lh /var/log/nginx/
-```
-
-**Impact:** Disk fills → OS cannot write temp files, create sockets, or fork processes → system instability, SSH may become unresponsive.
-
-**Immediate recovery (zero downtime):**
-```bash
+# Immediate fix — truncate safely without restarting NGINX
 truncate -s 0 /var/log/nginx/access.log
 truncate -s 0 /var/log/nginx/error.log
-```
 
-**Long-term fix — configure logrotate:**
-```
+# Long-term — configure logrotate
+cat > /etc/logrotate.d/nginx <<EOF
 /var/log/nginx/*.log {
     daily
     rotate 14
@@ -57,128 +69,82 @@ truncate -s 0 /var/log/nginx/error.log
         nginx -s reopen
     endscript
 }
-```
+EOF
 
-```bash
-logrotate -d /etc/logrotate.d/nginx   # dry run
-logrotate -f /etc/logrotate.d/nginx   # force rotate now
+logrotate -f /etc/logrotate.d/nginx
 ```
-
-**Prevention:** Send NGINX logs to CloudWatch Logs, Datadog, or Loki and disable local file logging entirely.
 
 ---
 
-## Cause 2: Systemd Journal Logs Unbounded
+### Cause 2 — Systemd journal unbounded (Likelihood: High)
 
-**Likelihood: High**
+**Impact:** Silently grows over weeks, fills the same partition.
 
-Ubuntu 24.04 uses persistent journal storage by default with no size cap.
-
-**Diagnosis:**
 ```bash
-journalctl --disk-usage
-ls -lh /var/log/journal/
-```
-
-**Immediate recovery:**
-```bash
-journalctl --vacuum-time=7d
+# Immediate fix
 journalctl --vacuum-size=1G
-```
 
-**Long-term fix:**
-```bash
-# /etc/systemd/journald.conf
-[Journal]
-SystemMaxUse=2G
-SystemKeepFree=1G
-MaxRetentionSec=7day
-
+# Long-term — cap journal size permanently
+sed -i 's/#SystemMaxUse=/SystemMaxUse=2G/' /etc/systemd/journald.conf
 systemctl restart systemd-journald
 ```
 
 ---
 
-## Cause 3: Core Dumps Accumulating
+### Cause 3 — Core dumps accumulating (Likelihood: Medium)
 
-**Likelihood: Medium**
+**Impact:** Each dump is 1–4 GB — multiple crashes silently drain disk.
 
-If NGINX workers ever crashed (OOM, SIGSEGV), the OS writes core dump files of multiple GB each.
-
-**Diagnosis:**
 ```bash
-find / -name "core*" -type f 2>/dev/null
-ls -lh /var/crash/
-```
-
-**Immediate recovery:**
-```bash
+# Immediate fix
 rm -f /var/crash/* 2>/dev/null
 find / -name "core.*" -type f -delete 2>/dev/null
-```
 
-**Long-term fix:**
-```bash
-# /etc/security/limits.conf
-* hard core 0
-* soft core 0
-
-# /etc/sysctl.conf
-kernel.core_pattern = /dev/null
+# Long-term — disable core dumps
+echo "* hard core 0" >> /etc/security/limits.conf
+echo "kernel.core_pattern = /dev/null" >> /etc/sysctl.conf
 sysctl -p
 ```
 
 ---
 
-## Cause 4: NGINX Client Body Temp Files Not Cleaned
+### Cause 4 — NGINX temp files not cleaned (Likelihood: Medium)
 
-**Likelihood: Medium**
+**Impact:** Abandoned upload buffers accumulate on abnormal request termination.
 
-NGINX buffers request bodies to disk. On abnormal termination, temp files are orphaned.
-
-**Diagnosis:**
 ```bash
-du -sh /var/lib/nginx/tmp/
-```
-
-**Immediate recovery:**
-```bash
+# Immediate fix — delete files older than 1 hour
 find /var/lib/nginx/tmp/ -type f -mmin +60 -delete
-```
 
-**Long-term fix:** Add hourly cron job or disable disk buffering:
-```nginx
-proxy_request_buffering off;
-proxy_max_temp_file_size 0;
+# Long-term — disable disk buffering in NGINX config
+# proxy_request_buffering off;
+# proxy_max_temp_file_size 0;
 ```
 
 ---
 
-## Cause 5: Old Kernel Packages / APT Cache
-
-**Likelihood: Low-Medium**
+### Cause 5 — Old packages / apt cache (Likelihood: Low-Medium)
 
 ```bash
-apt autoremove -y && apt clean && apt autoclean
+apt autoremove -y && apt clean
 ```
 
 ---
 
-## Recovery Priority Order
+## Recovery Priority
 
-| Priority | Action | Disk freed (typical) |
+| Priority | Action | Typical disk freed |
 |---|---|---|
-| 1 | Truncate NGINX logs | 10-50 GB |
-| 2 | Vacuum systemd journals | 2-10 GB |
-| 3 | Remove core dumps | 1-8 GB |
-| 4 | Clean NGINX temp files | 0.5-5 GB |
-| 5 | apt autoremove and apt clean | 0.5-2 GB |
+| 1 | Truncate NGINX logs | 10–50 GB |
+| 2 | Vacuum systemd journals | 2–10 GB |
+| 3 | Remove core dumps | 1–8 GB |
+| 4 | Clean NGINX temp files | 0.5–5 GB |
+| 5 | apt autoremove + clean | 0.5–2 GB |
 
 ---
 
-## Monitoring & Alerting to Add
+## Prevention
 
-- Disk usage > 75% -- Warning alert
-- Disk usage > 85% -- Critical alert
-- NGINX log file > 5GB -- trigger logrotate
-- Journal size > 2GB -- vacuum journals
+- Alert at **75% disk** (warning) and **85%** (critical) — before it becomes an incident
+- Ship NGINX logs to a centralised system (CloudWatch Logs, Loki) and disable local file logging
+- Set journal size cap and logrotate on every new VM as part of the base image / user-data script
