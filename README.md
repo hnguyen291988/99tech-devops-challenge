@@ -58,7 +58,7 @@ commit's diff is the before-and-after:
 
 ```bash
 git log --oneline
-git diff --stat 'HEAD~4' 'HEAD~3' -- src/problem3     # the problem 3 fixes
+git diff --stat ':/add challenge skeleton' ':/fix problem 3 stack' -- src/problem3
 ```
 
 An earlier version of this repo held answers to the previous version of the challenge, whose problem set and
