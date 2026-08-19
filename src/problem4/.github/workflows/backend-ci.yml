@@ -1,0 +1,174 @@
+# Pull-request checks for the backend API.
+#
+# This workflow never deploys and never assumes an AWS role. It has no
+# id-token permission, so even a compromised dependency in a test run cannot
+# reach AWS.
+name: backend-ci
+
+on:
+  pull_request:
+    paths:
+      - "apps/api/**"
+      - ".github/workflows/backend-ci.yml"
+      - ".github/workflows/backend-deploy.yml"
+      - ".github/workflows/_backend-deploy-env.yml"
+      - "deploy/backend/**"
+  # Also run on main so the default branch always has a green baseline to
+  # compare a failing PR against.
+  push:
+    branches: [main]
+    paths:
+      - "apps/api/**"
+
+# One run per ref. Superseded PR runs are cancelled; see backend-deploy.yml
+# for why deploys deliberately do the opposite.
+concurrency:
+  group: backend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: apps/api
+
+env:
+  NODE_VERSION: "20.18.1"
+
+jobs:
+  verify:
+    name: lint, typecheck, test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: ci
+          POSTGRES_DB: api_test
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+        ports:
+          - 5432:5432
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/api/package-lock.json
+
+      # ci, not install: installs the lockfile exactly and fails if
+      # package.json and the lock have drifted apart.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit and integration tests
+        run: npm test -- --coverage
+        env:
+          DATABASE_URL: postgres://postgres:ci@localhost:5432/api_test
+
+      # Uploaded even on failure: the report is most useful when tests fail.
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: api-test-results-${{ github.sha }}
+          path: |
+            apps/api/coverage/
+            apps/api/junit.xml
+          retention-days: 7
+          if-no-files-found: warn
+
+  build:
+    name: build artifact
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/api/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      # Proves the artifact assembles on a PR. The deploy pipeline builds its
+      # own from the merged commit -- a PR artifact is never deployed, because
+      # what passed CI on a branch is not what lands on main.
+      - name: Package deployment bundle
+        run: bash ../../deploy/backend/package.sh "${{ github.sha }}"
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: api-bundle-${{ github.sha }}
+          path: apps/api/dist-bundle/api-${{ github.sha }}.tar.gz
+          retention-days: 7
+
+  security:
+    name: security scans
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      security-events: write # required to publish SARIF to the Security tab
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0 # gitleaks needs history to scan the diff
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/api/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      # Blocks on high and critical only. Failing a PR on a moderate advisory
+      # in a transitive dev dependency is how teams learn to add
+      # --audit-level=none and stop reading the output entirely.
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+      - name: Filesystem and dependency scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: apps/api
+          format: sarif
+          output: trivy-api.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true # an unfixable advisory is a backlog item, not a merge blocker
+
+      - name: Publish scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@f3712979fa5f215279b101dd0a2e3bdfb4353324 # v3
+        with:
+          sarif_file: trivy-api.sarif
+          category: trivy-api
+
+      - name: Secret scan
+        uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -1,0 +1,225 @@
+# Reusable: deploy one already-built backend bundle to one environment.
+#
+# Called twice by backend-deploy.yml (staging, then production) and once by
+# rollback.yml. Having a single implementation means the rollback path is the
+# same code as the deploy path, which is the only way rollback is ever actually
+# tested.
+name: _backend-deploy-env
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub environment: staging | production"
+        required: true
+        type: string
+      version:
+        description: "Short commit SHA identifying the artifact"
+        required: true
+        type: string
+      bundle:
+        description: "Bundle filename produced by the build job"
+        required: true
+        type: string
+      artifact_run_id:
+        description: "Run to download the bundle from. Defaults to this run."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: false
+
+jobs:
+  deploy:
+    name: deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    # The approval gate, the environment-scoped IAM role, and the deployment
+    # history all hang off this one line. Reviewers required on production is a
+    # setting on the environment, not something a workflow can bypass.
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.PUBLIC_URL }}
+
+    # Serialise per environment. Two concurrent CodeDeploy deployments to one
+    # group is a rejected API call at best and an inconsistent fleet at worst.
+    concurrency:
+      group: backend-deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      id-token: write # OIDC only. No AWS keys exist in this repository.
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      APP: ${{ vars.CODEDEPLOY_APPLICATION }}
+      GROUP: ${{ vars.CODEDEPLOY_DEPLOYMENT_GROUP }}
+      BUCKET: ${{ vars.ARTIFACT_BUCKET }}
+      KEY: api/${{ inputs.version }}/${{ inputs.bundle }}
+      HEALTH_URL: ${{ vars.HEALTH_CHECK_URL }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download bundle
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: api-bundle-${{ inputs.version }}
+          path: bundle
+          # Set by rollback.yml to pull the artifact from the original build run
+          # rather than rebuilding it.
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-api-${{ inputs.environment }}-${{ inputs.version }}
+          # Short-lived by default (1h). The trust policy on the role is scoped
+          # to this repository AND to this environment, so a workflow running
+          # against staging cannot assume the production role even if someone
+          # edits the workflow file.
+          role-duration-seconds: 3600
+
+      # Cheap, and it has saved me from deploying to the wrong account.
+      - name: Confirm identity
+        run: |
+          aws sts get-caller-identity --no-cli-pager
+          echo "Deploying api ${{ inputs.version }} to ${{ inputs.environment }}"
+
+      # Recorded BEFORE we change anything, so rollback has a concrete target
+      # rather than "whatever was there before, probably".
+      - name: Record current revision for rollback
+        id: current
+        run: |
+          set -Eeuo pipefail
+          prev_id=$(aws deploy list-deployments \
+            --application-name "$APP" \
+            --deployment-group-name "$GROUP" \
+            --include-only-statuses Succeeded \
+            --query 'deployments[0]' --output text --no-cli-pager)
+
+          if [[ "$prev_id" == "None" || -z "$prev_id" ]]; then
+            echo "No previous successful deployment; this looks like a first deploy."
+            echo "previous_key=" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          prev_key=$(aws deploy get-deployment --deployment-id "$prev_id" \
+            --query 'deploymentInfo.revision.s3Location.key' --output text --no-cli-pager)
+          echo "Previous good revision: $prev_key (deployment $prev_id)"
+          echo "previous_key=${prev_key}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload bundle to S3
+        run: |
+          set -Eeuo pipefail
+          aws s3 cp "bundle/${{ inputs.bundle }}" "s3://${BUCKET}/${KEY}" \
+            --no-cli-pager \
+            --metadata "commit=${{ github.sha }},run=${{ github.run_id }},env=${{ inputs.environment }}"
+
+      - name: Create CodeDeploy deployment
+        id: deploy
+        run: |
+          set -Eeuo pipefail
+          deployment_id=$(aws deploy create-deployment \
+            --application-name "$APP" \
+            --deployment-group-name "$GROUP" \
+            --description "gha ${{ github.run_id }} ${{ inputs.version }}" \
+            --s3-location "bucket=${BUCKET},key=${KEY},bundleType=tgz" \
+            --file-exists-behavior OVERWRITE \
+            --query 'deploymentId' --output text --no-cli-pager)
+          echo "deployment_id=${deployment_id}" >> "$GITHUB_OUTPUT"
+          echo "Started $deployment_id"
+
+      # The deployment group is configured blue/green with automatic rollback on
+      # failure or alarm, so most bad deploys never finish shifting traffic.
+      # This waits for CodeDeploy's own verdict.
+      - name: Wait for deployment
+        id: wait
+        run: |
+          set -Eeuo pipefail
+          if aws deploy wait deployment-successful \
+               --deployment-id "${{ steps.deploy.outputs.deployment_id }}" --no-cli-pager; then
+            echo "CodeDeploy reported success"
+          else
+            echo "::error::CodeDeploy did not succeed. Diagnostics follow."
+            aws deploy get-deployment \
+              --deployment-id "${{ steps.deploy.outputs.deployment_id }}" \
+              --query 'deploymentInfo.{status:status,error:errorInformation,rollback:rollbackInfo}' \
+              --output json --no-cli-pager
+            aws deploy list-deployment-targets \
+              --deployment-id "${{ steps.deploy.outputs.deployment_id }}" \
+              --output json --no-cli-pager || true
+            exit 1
+          fi
+
+      # An independent check through the public ALB. CodeDeploy's ValidateService
+      # hook runs on the instance against localhost, which cannot tell you that
+      # the target group, listener rule or security group is wrong.
+      - name: Verify through the load balancer
+        id: verify
+        run: |
+          set -Eeuo pipefail
+          expected="${{ inputs.version }}"
+          for attempt in $(seq 1 20); do
+            body=$(curl -fsS --max-time 10 "${HEALTH_URL}" || echo '')
+            if [[ -n "$body" ]]; then
+              echo "attempt ${attempt}: ${body}"
+              # The app reports the build it is running, so this proves the new
+              # version is live -- not merely that something answers 200.
+              if grep -q "\"version\":\"${expected}\"" <<<"$body"; then
+                echo "Verified version ${expected} serving through the load balancer"
+                exit 0
+              fi
+            fi
+            sleep 15
+          done
+          echo "::error::${HEALTH_URL} never reported version ${expected} after 5 minutes"
+          exit 1
+
+      # Only reached if CodeDeploy said success but the live check disagreed --
+      # exactly the case its own auto-rollback cannot detect.
+      - name: Roll back to previous revision
+        if: failure() && steps.wait.outcome == 'success' && steps.current.outputs.previous_key != ''
+        run: |
+          set -Eeuo pipefail
+          echo "::warning::Post-deploy verification failed. Rolling back to ${{ steps.current.outputs.previous_key }}"
+          rollback_id=$(aws deploy create-deployment \
+            --application-name "$APP" \
+            --deployment-group-name "$GROUP" \
+            --description "auto-rollback of run ${{ github.run_id }}" \
+            --s3-location "bucket=${BUCKET},key=${{ steps.current.outputs.previous_key }},bundleType=tgz" \
+            --file-exists-behavior OVERWRITE \
+            --query 'deploymentId' --output text --no-cli-pager)
+          echo "Rollback deployment ${rollback_id}"
+          aws deploy wait deployment-successful --deployment-id "$rollback_id" --no-cli-pager
+          echo "Rolled back. The bad revision is still in S3 for investigation."
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### api → ${{ inputs.environment }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | \`${{ inputs.version }}\` |"
+            echo "| Commit | ${{ github.sha }} |"
+            echo "| Artifact | \`s3://${BUCKET}/${KEY}\` |"
+            echo "| CodeDeploy | \`${{ steps.deploy.outputs.deployment_id }}\` |"
+            echo "| Previous revision | \`${{ steps.current.outputs.previous_key }}\` |"
+            echo "| Result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify on failure
+        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -fsS -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":rotating_light: api deploy to *${{ inputs.environment }}* failed — version \`${{ inputs.version }}\` — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|run>\"}" \
+            "$SLACK_WEBHOOK_URL"

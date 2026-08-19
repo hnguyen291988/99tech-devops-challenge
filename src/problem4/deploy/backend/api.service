@@ -1,0 +1,43 @@
+[Unit]
+Description=Backend HTTP API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=api
+Group=api
+WorkingDirectory=/opt/api
+ExecStart=/usr/bin/node /opt/api/dist/index.js
+
+# Configuration comes from SSM Parameter Store / Secrets Manager, fetched into
+# this file by before_install.sh. Nothing environment-specific is baked into
+# the artifact, which is what lets one build serve every environment.
+EnvironmentFile=/etc/api/env
+
+Restart=always
+RestartSec=2
+
+# Long enough for the app's own drain (stop accepting, finish in flight, close
+# pools) to complete before SIGKILL. Must exceed the app's shutdown grace.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=api
+
+# Cheap hardening. This process needs to read its own directory, talk to the
+# network, and nothing else.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/api/tmp
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

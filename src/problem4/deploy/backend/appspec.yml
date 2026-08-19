@@ -1,0 +1,53 @@
+# CodeDeploy bundle manifest.
+#
+# The deployment group is configured blue/green with traffic control on the ALB:
+# a fresh set of instances is provisioned, the hooks below run against them
+# while they receive no production traffic, and only then does the listener
+# shift. That ordering is why ValidateService is able to block a bad release
+# rather than merely notice one.
+version: 0.0
+os: linux
+
+files:
+  - source: /app
+    destination: /opt/api
+  - source: /api.service
+    destination: /etc/systemd/system
+
+permissions:
+  - object: /opt/api
+    owner: api
+    group: api
+    mode: "750"
+    type: [directory, file]
+
+hooks:
+  # Runs on the replacement instances only, before any traffic.
+  BeforeInstall:
+    - location: scripts/before_install.sh
+      timeout: 120
+      runas: root
+
+  AfterInstall:
+    - location: scripts/after_install.sh
+      timeout: 120
+      runas: root
+
+  ApplicationStart:
+    - location: scripts/application_start.sh
+      timeout: 180
+      runas: root
+
+  # The gate. A non-zero exit here fails the deployment and CodeDeploy rolls
+  # back without ever shifting the listener.
+  ValidateService:
+    - location: scripts/validate_service.sh
+      timeout: 300
+      runas: root
+
+  # Runs on the OLD instances after traffic has moved away, so connections
+  # already in flight are allowed to finish.
+  BeforeBlockTraffic:
+    - location: scripts/application_stop.sh
+      timeout: 120
+      runas: root

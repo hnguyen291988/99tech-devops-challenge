@@ -1,0 +1,129 @@
+# Continuous delivery for the backend API.
+#
+# Build once on main, then promote that exact artifact through staging and into
+# production. Nothing is ever rebuilt between environments -- the bytes that
+# were tested in staging are the bytes that reach production.
+name: backend-deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/api/**"
+      - "deploy/backend/**"
+      - ".github/workflows/backend-deploy.yml"
+      - ".github/workflows/_backend-deploy-env.yml"
+  # Lets us re-promote a known-good commit without pushing anything.
+  workflow_dispatch:
+    inputs:
+      skip_staging:
+        description: "Deploy straight to production (incident use only)"
+        type: boolean
+        default: false
+
+# Never cancel a deploy in flight. A cancelled CodeDeploy run leaves an
+# ambiguous half-shifted target group, which is far worse than queueing.
+concurrency:
+  group: backend-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20.18.1"
+
+jobs:
+  build:
+    name: build ${{ github.sha }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write      # for Sigstore provenance below, NOT for AWS --
+      attestations: write  # no AWS role trusts a token minted by this job
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      bundle: ${{ steps.meta.outputs.bundle }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/api/package-lock.json
+
+      - name: Derive version
+        id: meta
+        run: |
+          version="${GITHUB_SHA::12}"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "bundle=api-${version}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "Building api version ${version}" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install dependencies
+        working-directory: apps/api
+        run: npm ci
+
+      - name: Test
+        working-directory: apps/api
+        run: npm test
+        env:
+          NODE_ENV: test
+
+      - name: Build
+        working-directory: apps/api
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      - name: Package deployment bundle
+        run: bash deploy/backend/package.sh "${{ steps.meta.outputs.version }}"
+
+      # Signed provenance: records which workflow, at which commit, produced
+      # this exact file. Lets us answer "where did this artifact come from"
+      # months later without trusting a filename.
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
+        with:
+          subject-path: apps/api/dist-bundle/${{ steps.meta.outputs.bundle }}
+
+      - name: Upload bundle
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: api-bundle-${{ steps.meta.outputs.version }}
+          path: apps/api/dist-bundle/${{ steps.meta.outputs.bundle }}
+          retention-days: 30 # long enough to roll back to any recent release
+          if-no-files-found: error
+
+  staging:
+    name: staging
+    needs: build
+    if: ${{ !inputs.skip_staging }}
+    uses: ./.github/workflows/_backend-deploy-env.yml
+    with:
+      environment: staging
+      version: ${{ needs.build.outputs.version }}
+      bundle: ${{ needs.build.outputs.bundle }}
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write
+
+  production:
+    name: production
+    needs: [build, staging]
+    # always() so an explicitly skipped staging job does not block an
+    # incident-time direct deploy. The environment's own approval gate is
+    # what actually protects production.
+    if: ${{ always() && needs.build.result == 'success' && (needs.staging.result == 'success' || inputs.skip_staging) }}
+    uses: ./.github/workflows/_backend-deploy-env.yml
+    with:
+      environment: production
+      version: ${{ needs.build.outputs.version }}
+      bundle: ${{ needs.build.outputs.bundle }}
+    permissions:
+      contents: read
+      id-token: write
+      deployments: write

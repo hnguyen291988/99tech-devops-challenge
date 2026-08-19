@@ -1,0 +1,89 @@
+# Manual rollback for either application.
+#
+# Deliberately a first-class workflow rather than "revert the commit and wait
+# for CI". Reverting rebuilds, which takes as long as a deploy, can fail, and
+# needs a green pipeline -- none of which you want at 3am. This re-deploys an
+# artifact that has already been built and already been in production, using
+# the exact same deploy code path as a normal release.
+name: rollback
+
+on:
+  workflow_dispatch:
+    inputs:
+      application:
+        description: "Which application to roll back"
+        required: true
+        type: choice
+        options: [api, web]
+      environment:
+        description: "Which environment"
+        required: true
+        type: choice
+        options: [staging, production]
+      version:
+        description: "Short commit SHA to roll back to (12 chars, from the deploy summary)"
+        required: true
+        type: string
+      artifact_run_id:
+        description: "Run ID of the build that produced that version"
+        required: true
+        type: string
+      reason:
+        description: "Why (recorded in the run summary and the audit trail)"
+        required: true
+        type: string
+
+concurrency:
+  group: rollback-${{ inputs.application }}-${{ inputs.environment }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    name: record intent
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Write summary
+        run: |
+          {
+            echo "## Rollback requested"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Application | \`${{ inputs.application }}\` |"
+            echo "| Environment | \`${{ inputs.environment }}\` |"
+            echo "| Target version | \`${{ inputs.version }}\` |"
+            echo "| Source run | ${{ inputs.artifact_run_id }} |"
+            echo "| Requested by | @${{ github.actor }} |"
+            echo "| Reason | ${{ inputs.reason }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  api:
+    name: api
+    needs: record
+    if: ${{ inputs.application == 'api' }}
+    uses: ./.github/workflows/_backend-deploy-env.yml
+    with:
+      environment: ${{ inputs.environment }}
+      version: ${{ inputs.version }}
+      bundle: api-${{ inputs.version }}.tar.gz
+      artifact_run_id: ${{ inputs.artifact_run_id }}
+    permissions:
+      contents: read
+      id-token: write
+
+  web:
+    name: web
+    needs: record
+    if: ${{ inputs.application == 'web' }}
+    uses: ./.github/workflows/_frontend-deploy-env.yml
+    with:
+      environment: ${{ inputs.environment }}
+      version: ${{ inputs.version }}
+      artifact_run_id: ${{ inputs.artifact_run_id }}
+    permissions:
+      contents: read
+      id-token: write
