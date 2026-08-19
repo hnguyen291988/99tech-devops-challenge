@@ -1,0 +1,156 @@
+# Reusable: publish one already-built frontend bundle to one environment.
+name: _frontend-deploy-env
+
+on:
+  workflow_call:
+    inputs:
+      environment:
+        description: "GitHub environment: staging | production"
+        required: true
+        type: string
+      version:
+        description: "Short commit SHA identifying the build"
+        required: true
+        type: string
+      artifact_run_id:
+        description: "Run to download the build from. Defaults to this run."
+        required: false
+        type: string
+        default: ""
+    secrets:
+      SLACK_WEBHOOK_URL:
+        required: false
+
+jobs:
+  deploy:
+    name: deploy to ${{ inputs.environment }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    environment:
+      name: ${{ inputs.environment }}
+      url: ${{ vars.PUBLIC_URL }}
+
+    concurrency:
+      group: frontend-deploy-${{ inputs.environment }}
+      cancel-in-progress: false
+
+    permissions:
+      contents: read
+      id-token: write
+
+    env:
+      AWS_REGION: ${{ vars.AWS_REGION }}
+      BUCKET: ${{ vars.WEB_BUCKET }}
+      DISTRIBUTION_ID: ${{ vars.CLOUDFRONT_DISTRIBUTION_ID }}
+      PUBLIC_URL: ${{ vars.PUBLIC_URL }}
+      API_BASE_URL: ${{ vars.API_BASE_URL }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Download build
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: web-dist-${{ inputs.version }}
+          path: dist
+          run-id: ${{ inputs.artifact_run_id || github.run_id }}
+          github-token: ${{ github.token }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+          role-session-name: gha-web-${{ inputs.environment }}-${{ inputs.version }}
+          role-duration-seconds: 3600
+
+      - name: Confirm identity
+        run: aws sts get-caller-identity --no-cli-pager
+
+      # This is what keeps "build once" true for a single-page app. The bundle
+      # contains no environment-specific values; it fetches this file at boot.
+      - name: Write runtime configuration
+        run: |
+          set -Eeuo pipefail
+          cat > dist/config.json <<JSON
+          {
+            "environment": "${{ inputs.environment }}",
+            "apiBaseUrl": "${API_BASE_URL}",
+            "buildId": "${{ inputs.version }}",
+            "commit": "${{ github.sha }}"
+          }
+          JSON
+          cat dist/config.json
+
+      # Keep every release addressable so rollback is a copy, not a rebuild.
+      - name: Archive this release
+        run: |
+          set -Eeuo pipefail
+          aws s3 sync dist "s3://${BUCKET}/releases/${{ inputs.version }}/" \
+            --only-show-errors --no-cli-pager
+          echo "Archived to s3://${BUCKET}/releases/${{ inputs.version }}/"
+
+      - name: Publish to the live prefix
+        run: bash deploy/frontend/sync.sh dist "${BUCKET}"
+
+      # Only the entry points. Invalidating /* would cost per-path above the
+      # free tier and would needlessly evict immutable, content-hashed assets
+      # that are still perfectly valid.
+      - name: Invalidate CloudFront entry points
+        id: invalidate
+        run: |
+          set -Eeuo pipefail
+          invalidation_id=$(aws cloudfront create-invalidation \
+            --distribution-id "$DISTRIBUTION_ID" \
+            --paths '/' '/index.html' '/config.json' '/build-id.txt' \
+            --query 'Invalidation.Id' --output text --no-cli-pager)
+          echo "invalidation_id=${invalidation_id}" >> "$GITHUB_OUTPUT"
+          aws cloudfront wait invalidation-completed \
+            --distribution-id "$DISTRIBUTION_ID" --id "$invalidation_id" --no-cli-pager
+
+      - name: Verify the live site serves this build
+        run: |
+          set -Eeuo pipefail
+          for attempt in $(seq 1 10); do
+            served=$(curl -fsS --max-time 10 "${PUBLIC_URL%/}/build-id.txt" || echo '')
+            echo "attempt ${attempt}: served build-id='${served}'"
+            if [[ "$served" == "${{ inputs.version }}" ]]; then
+              # index.html must never be cached at the edge, or a deploy takes
+              # up to the TTL to become visible and rollbacks appear not to work.
+              cc=$(curl -fsSI --max-time 10 "${PUBLIC_URL%/}/index.html" \
+                   | tr -d '\r' | grep -i '^cache-control:' || echo 'none')
+              echo "index.html ${cc}"
+              grep -qi 'no-cache' <<<"$cc" || echo "::warning::index.html is not no-cache"
+              echo "Verified ${{ inputs.version }} live at ${PUBLIC_URL}"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::${PUBLIC_URL} is not serving build ${{ inputs.version }}"
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### web → ${{ inputs.environment }}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Build | \`${{ inputs.version }}\` |"
+            echo "| Commit | ${{ github.sha }} |"
+            echo "| Bucket | \`s3://${BUCKET}\` |"
+            echo "| Release archive | \`s3://${BUCKET}/releases/${{ inputs.version }}/\` |"
+            echo "| Invalidation | \`${{ steps.invalidate.outputs.invalidation_id }}\` |"
+            echo "| URL | ${PUBLIC_URL} |"
+            echo "| Result | ${{ job.status }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify on failure
+        if: failure() && env.SLACK_WEBHOOK_URL != ''
+        run: |
+          curl -fsS -X POST -H 'Content-type: application/json' \
+            --data "{\"text\":\":rotating_light: web deploy to *${{ inputs.environment }}* failed — build \`${{ inputs.version }}\` — <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|run>\"}" \
+            "$SLACK_WEBHOOK_URL"

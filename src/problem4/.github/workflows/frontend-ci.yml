@@ -1,0 +1,118 @@
+# Pull-request checks for the frontend SPA.
+name: frontend-ci
+
+on:
+  pull_request:
+    paths:
+      - "apps/web/**"
+      - ".github/workflows/frontend-ci.yml"
+      - ".github/workflows/frontend-deploy.yml"
+      - ".github/workflows/_frontend-deploy-env.yml"
+      - "deploy/frontend/**"
+  push:
+    branches: [main]
+    paths:
+      - "apps/web/**"
+
+concurrency:
+  group: frontend-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+    working-directory: apps/web
+
+env:
+  NODE_VERSION: "20.18.1"
+
+jobs:
+  verify:
+    name: lint, test, build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Unit tests
+        run: npm test -- --coverage
+
+      # No environment-specific values are passed here. The bundle is built once
+      # and reads its API endpoint from /config.json, written at deploy time.
+      # Baking VITE_API_URL into the build would mean a separate build per
+      # environment, and then staging has never actually tested production's
+      # bytes. See SOLUTION.md.
+      - name: Build
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      # A performance regression is a bug that no test catches. This makes the
+      # bundle size a reviewable number on the pull request.
+      - name: Bundle size budget
+        run: bash ../../deploy/frontend/check-size.sh dist 600
+
+      - name: Upload build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: web-dist-${{ github.sha }}
+          path: apps/web/dist
+          retention-days: 7
+          if-no-files-found: error
+
+  security:
+    name: security scans
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Dependency audit
+        run: npm audit --audit-level=high
+
+      - name: Dependency scan
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: fs
+          scan-ref: apps/web
+          format: sarif
+          output: trivy-web.sarif
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+
+      - name: Publish scan results
+        if: always()
+        uses: github/codeql-action/upload-sarif@f3712979fa5f215279b101dd0a2e3bdfb4353324 # v3
+        with:
+          sarif_file: trivy-web.sarif
+          category: trivy-web

@@ -1,0 +1,110 @@
+# Continuous delivery for the frontend SPA.
+#
+# One build, promoted through staging to production. Environment-specific
+# configuration is written at deploy time so the artifact stays identical.
+name: frontend-deploy
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "apps/web/**"
+      - "deploy/frontend/**"
+      - ".github/workflows/frontend-deploy.yml"
+      - ".github/workflows/_frontend-deploy-env.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: frontend-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  NODE_VERSION: "20.18.1"
+
+jobs:
+  build:
+    name: build ${{ github.sha }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+
+      - name: Derive version
+        id: meta
+        run: echo "version=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Install dependencies
+        working-directory: apps/web
+        run: npm ci
+
+      - name: Test
+        working-directory: apps/web
+        run: npm test
+
+      - name: Build
+        working-directory: apps/web
+        run: npm run build
+        env:
+          NODE_ENV: production
+
+      # Stamped into the bundle so a deploy can be verified from outside: fetch
+      # the live site and confirm which build is actually being served.
+      - name: Stamp build id
+        working-directory: apps/web
+        run: |
+          set -Eeuo pipefail
+          printf '%s' "${{ steps.meta.outputs.version }}" > dist/build-id.txt
+          test -f dist/index.html || { echo "::error::dist/index.html missing"; exit 1; }
+
+      - name: Bundle size budget
+        run: bash deploy/frontend/check-size.sh apps/web/dist 600
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
+        with:
+          subject-path: apps/web/dist/build-id.txt
+
+      - name: Upload build
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: web-dist-${{ steps.meta.outputs.version }}
+          path: apps/web/dist
+          retention-days: 30
+          if-no-files-found: error
+
+  staging:
+    name: staging
+    needs: build
+    uses: ./.github/workflows/_frontend-deploy-env.yml
+    with:
+      environment: staging
+      version: ${{ needs.build.outputs.version }}
+    permissions:
+      contents: read
+      id-token: write
+
+  production:
+    name: production
+    needs: [build, staging]
+    uses: ./.github/workflows/_frontend-deploy-env.yml
+    with:
+      environment: production
+      version: ${{ needs.build.outputs.version }}
+    permissions:
+      contents: read
+      id-token: write
