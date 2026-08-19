@@ -1,0 +1,12 @@
+# macOS
+.DS_Store
+
+# JetBrains / editors
+.idea/
+.vscode/
+
+# Node
+node_modules/
+
+# Local env overrides (see src/problem3/.env.example)
+.env
