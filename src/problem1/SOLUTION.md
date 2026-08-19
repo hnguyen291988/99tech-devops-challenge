@@ -131,11 +131,12 @@ flowchart TB
     ACC --> DDB
     MD --> RED
     AUTH --> RED
-
-    ME1 -.-> OBS
-    GW -.-> OBS
-    SET -.-> OBS
 ```
+
+Route 53 → CloudFront → WAF → ALB is the only ingress. The Cross-cutting box applies to every
+component above it; I've left it unconnected rather than drawing forty dotted lines across the
+diagram.
+
 
 ### The order lifecycle, in words
 
